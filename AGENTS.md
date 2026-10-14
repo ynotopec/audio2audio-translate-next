@@ -12,6 +12,7 @@ Lowest-latency audio-to-audio translation pipeline.
 - **TTS**: `k2-fsa/OmniVoice` — zero-shot, 600+ languages, 24 kHz output, RTF ~0.05.
   - Language goes in `generate(language=...)` (600+ names/codes), NOT in `instruct`.
   - `instruct` accepts a strict English keyword vocabulary only (accent/age/gender/pitch/whisper — e.g. `"male, moderate pitch"`); anything else raises ValueError. `instruct=None` = auto voice.
+  - **Voice consistency**: design/auto modes re-sample the speaker on every `generate()` call → the voice drifts sentence to sentence; a fixed `torch.manual_seed` does NOT fix it (verified with a speaker encoder). `backend/tts_engine.py` builds one `VoiceClonePrompt` per target language from a deterministic reference clip and passes it to every call → one stable voice (same-voice cosine 0.83 vs 0.61 for design). `TTS_VOICE` (instruct keyword, default `"female, moderate pitch"`) and `TTS_VOICE_SEED` (default `1234`) control the reference.
   - Qwen3-TTS backup kept as `backend/tts_engine_qwen.py` (transformers 4.57.3, incompatible with OmniVoice's transformers>=5).
 
 ## Function

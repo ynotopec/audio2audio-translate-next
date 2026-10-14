@@ -9,7 +9,9 @@ Lowest-latency audio-to-audio translation pipeline.
 
 - **ASR**: `nvidia/nemotron-3.5-asr-streaming-0.6b` — multilingual streaming speech recognition (40 languages, cache-aware FastConformer-RNNT, 80ms–1120ms latency)
 - **Translation**: MarianMT (`facebook/marian-mt-*`) — direct language pairs with English intermediary fallback
-- **TTS**: `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` — 10 languages, 9 voices, sub-100ms synthesis
+- **TTS** (select via `TTS_BACKEND` env var, default `qwen`):
+  - `qwen` → `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` — 10 languages, 9 voices, sub-100ms synthesis
+  - `omnivoce` → `k2-fsa/OmniVoice` — 600+ languages, zero-shot auto voice, RTF 0.025
 
 ## Function
 
@@ -30,4 +32,10 @@ Batch REST endpoint: upload audio file → receive translated audio.
 ## Languages
 
 ASR supports 40 locales (transcription-ready, broad-coverage, adaptation-ready).
-TTS supports 10 languages (Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian).
+TTS (Qwen3): 10 languages (Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian).
+TTS (OmniVoice, `TTS_BACKEND=omnivoce`): 600+ languages, zero-shot auto voice.
+
+## Environment
+
+- Qwen3-TTS path: `~/venv/audio2audio-translate-next-py312` (transformers 4.57.3)
+- OmniVoice path: `~/venv/audio2audio-omnivoice-py312` (transformers 5.19.0) — separate venv due to incompatible deps

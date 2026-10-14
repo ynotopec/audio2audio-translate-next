@@ -1,6 +1,10 @@
 """
 Audio-to-Audio Translator — Full Pipeline
-ASR (Nemotron 3.5 streaming) → Text Translation (MarianMT) → TTS (Qwen3-TTS)
+ASR (Nemotron 3.5 streaming) → Text Translation (MarianMT) → TTS (Qwen3-TTS or OmniVoice)
+
+TTS backend selection via env var TTS_BACKEND:
+  - "qwen"    : Qwen3-TTS-1.7B (default, 10 languages, speaker selection)
+  - "omnivoce": OmniVoice (600+ languages, zero-shot, auto voice)
 """
 
 import sys
@@ -25,8 +29,16 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 
 import tts_engine as _tts_engine
+import omnivoce_engine as _omnivoce_engine
 from translation import translate_text, init_translation, SUPPORTED_LANGS
 from streaming_asr import UtteranceStreamer
+
+# TTS backend selection (env var TTS_BACKEND: "qwen" or "omnivoce")
+_TTS_BACKEND = os.environ.get("TTS_BACKEND", "qwen").lower()
+if _TTS_BACKEND != "qwen":
+    _tts_engine = _omnivoce_engine  # swap to omnivoce backend
+
+_tts_engine_used = _tts_engine.__name__.split(".")[-1] if hasattr(_tts_engine, "__name__") else "unknown"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -117,6 +129,8 @@ async def root():
 async def health():
     return {
         "status": "ok",
+        "tts_backend": _TTS_BACKEND,
+        "tts_engine": _tts_engine_used,
         "asr_model": ASR_MODEL_ID if nemo_model else ASR_MODEL_ID + " (not loaded)",
         "tts_model": _tts_engine.model.__class__.__name__ if _tts_engine.model else "not loaded",
         "device": device,
@@ -339,4 +353,5 @@ async def startup():
     logger.info("Nemotron prompt-mode fallback (auto) installed ✓")
 
     init_translation()
+    logger.info(f"TTS backend: {_TTS_BACKEND} ({_tts_engine_used})")
     await _tts_engine.load_model()

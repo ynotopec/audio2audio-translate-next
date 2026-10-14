@@ -1,20 +1,30 @@
 """
 OmniVoice audio synthesis backend (k2-fsa/OmniVoice).
 
-Zero-shot, 600+ languages, output at 24 kHz, RTF ~0.05 on a modern GPU.
+Zero-shot, 600+ languages, output at 24 kHz.
 
-Three modes (see OmniVoice.generate):
-  1. voice clone  -> ref_audio + ref_text
-  2. voice design -> `instruct` string (strict keyword vocabulary, English only)
-  3. auto         -> neither, model picks a voice
+Voice consistency
+-----------------
+OmniVoice *voice design* / *auto* modes re-sample the speaker timbre on every
+``generate()`` call, so the voice drifts from sentence to sentence (measured
+with a speaker encoder: ~0.5 cosine between consecutive sentences = different
+speakers). A fixed ``torch.manual_seed`` does NOT fix this — the timbre is
+resampled per call regardless.
 
-Language is passed through the dedicated ``language`` argument, NOT through
-``instruct``: the model accepts 600+ language names/codes there. `instruct`
-only accepts a fixed English keyword list (accent / age / gender / pitch /
-whisper); anything else raises ValueError. Keep the two separate.
+The reliable way to keep one voice across utterances is **voice cloning**: build
+a ``VoiceClonePrompt`` once and pass it to every ``generate()`` call (measured
+~0.8 cosine across sentences = same speaker; transfers across languages too).
+We build one prompt per target language at first use and cache it.
+
+Language vs instruct
+--------------------
+``language`` (600+ names/codes) controls pronunciation and belongs in the
+dedicated argument. ``instruct`` accepts a strict English keyword vocabulary
+only (accent/age/gender/pitch/whisper); anything else raises ValueError.
 """
 import asyncio
 import logging
+import os
 from typing import Optional
 
 import numpy as np
@@ -27,6 +37,11 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 MODEL_ID = "k2-fsa/OmniVoice"
 SAMPLE_RATE = 24000
+
+# Reference voice used to build the clone prompt. Deterministic (fixed seed),
+# so the pipeline voice is stable across restarts too.
+VOICE_DESIGN = os.environ.get("TTS_VOICE", "female, moderate pitch")
+VOICE_REF_SEED = int(os.environ.get("TTS_VOICE_SEED", "1234"))
 
 # Locale id -> OmniVoice language name (passed to generate(language=...)).
 LANG_MAP = {
@@ -65,31 +80,51 @@ LANG_MAP = {
     "nb-NO": "Norwegian",
 }
 
-# Strict keyword vocabulary accepted by OmniVoice `instruct` (English only).
-# Anything outside this set raises ValueError at generate() time.
-_VALID_PITCH = {"very low pitch", "low pitch", "moderate pitch", "high pitch", "very high pitch"}
-
-# Voice presets: speaker id -> instruct string (valid keywords only).
-VOICE_PRESETS = {
-    "default":  "male, moderate pitch",
-    "male":     "male, moderate pitch",
-    "female":   "female, moderate pitch",
-    "whisper":  "whisper, moderate pitch",
+# Neutral reference sentence per language: spoken once to bake the timbre into
+# the clone prompt. Kept short so prompt creation is fast (~0.3 s, once/lang).
+REF_SENTENCES = {
+    "English": "Hello, this is a reference voice.",
+    "French": "Bonjour, ceci est une voix de référence.",
+    "German": "Hallo, dies ist eine Referenzstimme.",
+    "Spanish": "Hola, esta es una voz de referencia.",
+    "Italian": "Ciao, questa è una voce di riferimento.",
+    "Portuguese": "Olá, esta é uma voz de referência.",
+    "Russian": "Привет, это эталонный голос.",
+    "Chinese": "你好，这是一个参考声音。",
+    "Japanese": "こんにちは、これは参照音声です。",
+    "Korean": "안녕하세요, 참조 음성입니다.",
 }
+
+# Cache: language name -> VoiceClonePrompt
+_voice_prompts: dict = {}
 
 
 def _tts_lang(locale_id: str) -> str:
     return LANG_MAP.get(locale_id, "English")
 
 
-def _build_instruct(speaker: Optional[str]) -> Optional[str]:
-    """Map a speaker/preset name to a valid OmniVoice instruct string.
+def _ref_sentence(lang: str) -> str:
+    return REF_SENTENCES.get(lang, REF_SENTENCES["English"])
 
-    Returns None to trigger auto-voice mode when the preset is unknown.
-    """
-    if not speaker:
-        return None
-    return VOICE_PRESETS.get(str(speaker).lower())
+
+def _get_voice_prompt(lang: str):
+    """Build (once) and return the clone prompt for `lang`."""
+    if lang in _voice_prompts:
+        return _voice_prompts[lang]
+    ref_text = _ref_sentence(lang)
+    torch.manual_seed(VOICE_REF_SEED)
+    ref_audio = model.generate(
+        text=ref_text,
+        language=lang,
+        instruct=VOICE_DESIGN,
+    )[0]
+    prompt = model.create_voice_clone_prompt(
+        (torch.as_tensor(np.asarray(ref_audio, dtype=np.float32)), SAMPLE_RATE),
+        ref_text=ref_text,
+    )
+    _voice_prompts[lang] = prompt
+    logger.info(f"Voice prompt locked for {lang} (design={VOICE_DESIGN!r}, seed={VOICE_REF_SEED})")
+    return prompt
 
 
 async def load_model():
@@ -107,29 +142,26 @@ async def load_model():
 async def synthesize(text: str, language: str, speaker: Optional[str] = None):
     """Synthesize `text` in `language` (locale id or language name).
 
-    Returns (float32 mono waveform, sample_rate).
+    Returns (float32 mono waveform, sample_rate). The speaker timbre is locked
+    to the cached clone prompt, so consecutive utterances share one voice.
     """
     if not text or not text.strip():
         return np.array([], dtype=np.float32), SAMPLE_RATE
 
     lang = _tts_lang(language)
-    instruct = _build_instruct(speaker)
-
-    logger.info(f"TTS OmniVoice: lang={lang}, instruct={instruct!r}, text_len={len(text)}")
+    logger.info(f"TTS OmniVoice: lang={lang}, text_len={len(text)}")
 
     loop = asyncio.get_running_loop()
 
     def _run():
-        gen_kwargs = dict(
+        prompt = _get_voice_prompt(lang)
+        audios = model.generate(
             text=text.strip(),
             language=lang,
-            num_step=32,       # quality; 16 for lower latency
+            voice_clone_prompt=prompt,
+            num_step=32,   # quality; 16 for lower latency
             speed=1.0,
         )
-        # instruct=None => auto voice mode (model picks the voice).
-        if instruct:
-            gen_kwargs["instruct"] = instruct
-        audios = model.generate(**gen_kwargs)
         wav = audios[0]
         if isinstance(wav, torch.Tensor):
             arr = wav.detach().cpu().float().numpy()
@@ -145,4 +177,4 @@ def get_supported_languages() -> list:
 
 
 def get_supported_speakers() -> list:
-    return list(VOICE_PRESETS.keys())
+    return [VOICE_DESIGN]

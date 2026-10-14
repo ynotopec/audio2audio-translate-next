@@ -28,17 +28,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 
-import tts_engine as _tts_engine
-import omnivoce_engine as _omnivoce_engine
+import tts_engine as _tts_engine  # OmniVoice (zero-shot, 600+ languages)
 from translation import translate_text, init_translation, SUPPORTED_LANGS
 from streaming_asr import UtteranceStreamer
 
-# TTS backend selection (env var TTS_BACKEND: "qwen" or "omnivoce")
-_TTS_BACKEND = os.environ.get("TTS_BACKEND", "qwen").lower()
-if _TTS_BACKEND != "qwen":
-    _tts_engine = _omnivoce_engine  # swap to omnivoce backend
-
-_tts_engine_used = _tts_engine.__name__.split(".")[-1] if hasattr(_tts_engine, "__name__") else "unknown"
+_TTS_BACKEND = "omnivoce"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -130,7 +124,7 @@ async def health():
     return {
         "status": "ok",
         "tts_backend": _TTS_BACKEND,
-        "tts_engine": _tts_engine_used,
+        "tts_engine": "omnivoce",
         "asr_model": ASR_MODEL_ID if nemo_model else ASR_MODEL_ID + " (not loaded)",
         "tts_model": _tts_engine.model.__class__.__name__ if _tts_engine.model else "not loaded",
         "device": device,
@@ -353,5 +347,5 @@ async def startup():
     logger.info("Nemotron prompt-mode fallback (auto) installed ✓")
 
     init_translation()
-    logger.info(f"TTS backend: {_TTS_BACKEND} ({_tts_engine_used})")
+    logger.info(f"TTS backend: {_TTS_BACKEND} (omnivoce)")
     await _tts_engine.load_model()

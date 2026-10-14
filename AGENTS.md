@@ -9,9 +9,10 @@ Lowest-latency audio-to-audio translation pipeline.
 
 - **ASR**: `nvidia/nemotron-3.5-asr-streaming-0.6b` — multilingual streaming speech recognition (40 languages, cache-aware FastConformer-RNNT, 80ms–1120ms latency)
 - **Translation**: MarianMT (`facebook/marian-mt-*`) — direct language pairs with English intermediary fallback
-- **TTS** (select via `TTS_BACKEND` env var, default `qwen`):
-  - `qwen` → `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` — 10 languages, 9 voices, sub-100ms synthesis
-  - `omnivoce` → `k2-fsa/OmniVoice` — 600+ languages, zero-shot auto voice, RTF 0.025
+- **TTS**: `k2-fsa/OmniVoice` — zero-shot, 600+ languages, 24 kHz output, RTF ~0.05.
+  - Language goes in `generate(language=...)` (600+ names/codes), NOT in `instruct`.
+  - `instruct` accepts a strict English keyword vocabulary only (accent/age/gender/pitch/whisper — e.g. `"male, moderate pitch"`); anything else raises ValueError. `instruct=None` = auto voice.
+  - Qwen3-TTS backup kept as `backend/tts_engine_qwen.py` (transformers 4.57.3, incompatible with OmniVoice's transformers>=5).
 
 ## Function
 
@@ -32,10 +33,16 @@ Batch REST endpoint: upload audio file → receive translated audio.
 ## Languages
 
 ASR supports 40 locales (transcription-ready, broad-coverage, adaptation-ready).
-TTS (Qwen3): 10 languages (Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian).
-TTS (OmniVoice, `TTS_BACKEND=omnivoce`): 600+ languages, zero-shot auto voice.
+TTS (OmniVoice): 600+ languages, zero-shot; locale ids mapped to language names in `backend/tts_engine.py`.
 
 ## Environment
 
-- Qwen3-TTS path: `~/venv/audio2audio-translate-next-py312` (transformers 4.57.3)
-- OmniVoice path: `~/venv/audio2audio-omnivoice-py312` (transformers 5.19.0) — separate venv due to incompatible deps
+- Single venv: `~/venv/audio2audio-translate-next-py312` (Python 3.12, transformers 5.19.0, torch 2.7.1+cu128).
+
+## Service
+
+```bash
+./run.sh                 # port 8741
+curl localhost:8741/health
+curl -X POST "localhost:8741/api/translate?src_lang=en-US&tgt_lang=fr-FR" -F "file=@in.wav" -o out.wav
+```

@@ -25,12 +25,18 @@ only (accent/age/gender/pitch/whisper); anything else raises ValueError.
 import asyncio
 import logging
 import os
+import threading
+import time
 from typing import Optional
 
 import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
+
+# OmniVoice inference is not reentrant: serialize prompt creation and
+# generation so concurrent utterances cannot interleave on the same weights.
+_MODEL_LOCK = threading.RLock()
 
 model = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -109,34 +115,52 @@ def _ref_sentence(lang: str) -> str:
 
 def _get_voice_prompt(lang: str):
     """Build (once) and return the clone prompt for `lang`."""
-    if lang in _voice_prompts:
-        return _voice_prompts[lang]
-    ref_text = _ref_sentence(lang)
-    torch.manual_seed(VOICE_REF_SEED)
-    ref_audio = model.generate(
-        text=ref_text,
-        language=lang,
-        instruct=VOICE_DESIGN,
-    )[0]
-    prompt = model.create_voice_clone_prompt(
-        (torch.as_tensor(np.asarray(ref_audio, dtype=np.float32)), SAMPLE_RATE),
-        ref_text=ref_text,
-    )
-    _voice_prompts[lang] = prompt
-    logger.info(f"Voice prompt locked for {lang} (design={VOICE_DESIGN!r}, seed={VOICE_REF_SEED})")
-    return prompt
+    with _MODEL_LOCK:
+        if lang in _voice_prompts:
+            return _voice_prompts[lang]
+        ref_text = _ref_sentence(lang)
+        torch.manual_seed(VOICE_REF_SEED)
+        ref_audio = model.generate(
+            text=ref_text,
+            language=lang,
+            instruct=VOICE_DESIGN,
+        )[0]
+        prompt = model.create_voice_clone_prompt(
+            (torch.as_tensor(np.asarray(ref_audio, dtype=np.float32)), SAMPLE_RATE),
+            ref_text=ref_text,
+        )
+        _voice_prompts[lang] = prompt
+        logger.info(f"Voice prompt locked for {lang} (design={VOICE_DESIGN!r}, seed={VOICE_REF_SEED})")
+        return prompt
 
 
-async def load_model():
+async def load_model(attempts: int = 6, delay_s: float = 10.0):
+    """Load OmniVoice, retrying on transient GPU OOM (shared device)."""
     global model
-    logger.info(f"Loading OmniVoice {MODEL_ID} on {device}…")
     from omnivoice import OmniVoice
-    model = OmniVoice.from_pretrained(
-        MODEL_ID,
-        device_map="cuda:0" if device == "cuda" else None,
-        dtype=torch.float16 if device == "cuda" else torch.float32,
-    )
-    logger.info(f"OmniVoice model loaded ✓ (sampling_rate={getattr(model, 'sampling_rate', SAMPLE_RATE)})")
+
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        logger.info(f"Loading OmniVoice {MODEL_ID} on {device}… (attempt {attempt})")
+        try:
+            model = OmniVoice.from_pretrained(
+                MODEL_ID,
+                device_map="cuda:0" if device == "cuda" else None,
+                dtype=torch.float16 if device == "cuda" else torch.float32,
+            )
+            logger.info(
+                f"OmniVoice model loaded ✓ (sampling_rate={getattr(model, 'sampling_rate', SAMPLE_RATE)})"
+            )
+            return model
+        except (torch.AcceleratorError, torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            msg = str(e).lower()
+            if "out of memory" not in msg and "memoryallocation" not in msg:
+                raise
+            last_err = e
+            logger.warning(f"TTS load attempt {attempt}/{attempts} hit GPU OOM; retrying in {delay_s:.0f}s")
+            torch.cuda.empty_cache()
+            time.sleep(delay_s)
+    raise RuntimeError(f"OmniVoice could not be loaded after {attempts} attempts: {last_err}")
 
 
 async def synthesize(text: str, language: str, speaker: Optional[str] = None):
@@ -154,14 +178,15 @@ async def synthesize(text: str, language: str, speaker: Optional[str] = None):
     loop = asyncio.get_running_loop()
 
     def _run():
-        prompt = _get_voice_prompt(lang)
-        audios = model.generate(
-            text=text.strip(),
-            language=lang,
-            voice_clone_prompt=prompt,
-            num_step=32,   # quality; 16 for lower latency
-            speed=1.0,
-        )
+        with _MODEL_LOCK:
+            prompt = _get_voice_prompt(lang)
+            audios = model.generate(
+                text=text.strip(),
+                language=lang,
+                voice_clone_prompt=prompt,
+                num_step=32,   # quality; 16 for lower latency
+                speed=1.0,
+            )
         wav = audios[0]
         if isinstance(wav, torch.Tensor):
             arr = wav.detach().cpu().float().numpy()

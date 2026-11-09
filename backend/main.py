@@ -1,38 +1,67 @@
 """
 Audio-to-Audio Translator — Full Pipeline
-ASR (Nemotron 3.5 streaming) → Text Translation (MarianMT) → TTS (Qwen3-TTS or OmniVoice)
+ASR (Nemotron 3.5 streaming) → Text Translation (MarianMT) → TTS (OmniVoice)
 
-TTS backend selection via env var TTS_BACKEND:
-  - "qwen"    : Qwen3-TTS-1.7B (default, 10 languages, speaker selection)
-  - "omnivoce": OmniVoice (600+ languages, zero-shot, auto voice)
+Imports are package-relative: the app must be launched as ``backend.main``
+(see run.sh / server.py). No sys.path manipulation, no absolute paths.
+
+TTS backend
+-----------
+``TTS_BACKEND`` selects the synthesis backend. Only ``omnivoice`` is supported
+by this environment: the legacy ``qwen`` backend (backend/tts_engine_qwen.py)
+requires transformers==4.57.3, which conflicts with omnivoice (transformers>=5).
 """
 
-import sys
-sys.path = [p for p in sys.path if not p.startswith("/home/ai-agent/.hermes/installs")]
-sys.path.insert(0, "/home/ai-agent/work/audio2audio-translate-next/backend")
-
 import asyncio
+import io
 import json
 import logging
-import threading
-import tempfile
 import os
-import io
+import tempfile
+import threading
+import time
+from contextlib import asynccontextmanager
+from math import gcd
 from typing import Optional
 
 import numpy as np
-import torch
 import soundfile as sf
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+import torch
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
+from fastapi.staticfiles import StaticFiles
+from scipy.signal import resample_poly
 
-import tts_engine as _tts_engine  # OmniVoice (zero-shot, 600+ languages)
-from translation import translate_text, init_translation, SUPPORTED_LANGS
-from streaming_asr import UtteranceStreamer
+_TTS_BACKEND = os.environ.get("TTS_BACKEND", "omnivoice").strip().lower()
+if _TTS_BACKEND in ("qwen", "qwen3", "qwen3-tts"):
+    raise RuntimeError(
+        "TTS_BACKEND=qwen needs transformers==4.57.3 and cannot coexist with "
+        "omnivoice (transformers>=5). Use a dedicated venv, or leave "
+        "TTS_BACKEND unset."
+    )
+if _TTS_BACKEND != "omnivoice":
+    raise RuntimeError(
+        f"Unknown TTS_BACKEND={_TTS_BACKEND!r} (expected 'omnivoice')"
+    )
 
-_TTS_BACKEND = "omnivoce"
+from . import tts_engine as _tts_engine  # OmniVoice (zero-shot, 600+ languages)
+from .streaming_asr import UtteranceStreamer
+from .translation import SUPPORTED_LANGS, init_translation, translate_text
+
+# One decode at a time on the shared ASR model (single GPU): concurrent
+# conformer_stream_step calls from several sockets otherwise thrash the device.
+ASR_DECODE_LOCK = threading.Lock()
+
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "50")) * 1024 * 1024
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -45,16 +74,40 @@ ASR_MODEL_ID = "nvidia/nemotron-3.5-asr-streaming-0.6b"
 SAMPLE_RATE = 16000
 
 # ── FastAPI app ─────────────────────────────────────
-app = FastAPI(title="Audio2Audio Translator", version="2.0.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Heavy models are loaded once, before the first request is served.
+    await _startup()
+    yield
+
+
+app = FastAPI(title="Audio2Audio Translator", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
+    # Wildcard origin is incompatible with credentials (and this API has no
+    # auth), so credentials are explicitly disabled.
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+def resample_audio(audio: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    """Resample with a polyphase anti-aliasing FIR.
+
+    ``np.interp`` (the previous approach) is linear interpolation with no
+    low-pass: decimating 48 kHz -> 16 kHz that way folds high frequencies back
+    into the speech band and degrades ASR.
+    """
+    if sr_in == sr_out or len(audio) == 0:
+        return np.asarray(audio, dtype=np.float32)
+    g = gcd(int(sr_in), int(sr_out))
+    up, down = int(sr_out) // g, int(sr_in) // g
+    return resample_poly(np.asarray(audio, dtype=np.float32), up, down).astype(np.float32)
+
 
 
 def trim_silence(audio: np.ndarray, sr: int, threshold: float = 1e-3, pad_ms: int = 60) -> np.ndarray:
@@ -124,7 +177,6 @@ async def health():
     return {
         "status": "ok",
         "tts_backend": _TTS_BACKEND,
-        "tts_engine": "omnivoce",
         "asr_model": ASR_MODEL_ID if nemo_model else ASR_MODEL_ID + " (not loaded)",
         "tts_model": _tts_engine.model.__class__.__name__ if _tts_engine.model else "not loaded",
         "device": device,
@@ -140,6 +192,11 @@ async def translate_file(
 ):
     """Batch: upload audio → translated WAV."""
     content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large (limit {MAX_UPLOAD_BYTES // (1024 * 1024)} MB)",
+        )
 
     with tempfile.NamedTemporaryFile(
         suffix=os.path.splitext(file.filename)[1] or ".wav", delete=False
@@ -152,13 +209,7 @@ async def translate_file(
         if audio_np.ndim > 1:
             audio_np = audio_np.mean(axis=1)
         if sr != SAMPLE_RATE:
-            ratio = SAMPLE_RATE / sr
-            new_len = int(len(audio_np) * ratio)
-            audio_np = np.interp(
-                np.linspace(0, len(audio_np) - 1, new_len),
-                np.arange(len(audio_np)),
-                audio_np,
-            )
+            audio_np = resample_audio(audio_np, sr, SAMPLE_RATE)
 
         # ASR with Nemotron (auto-detected language tag available)
         logger.info(f"ASR: {src_lang} → translate → {tgt_lang}")
@@ -237,7 +288,10 @@ async def ws_translate(ws: WebSocket):
                 if kind == "partial":
                     asyncio.run_coroutine_threadsafe(_send_partial(clean), loop)
                 else:
-                    asyncio.run_coroutine_threadsafe(_flush_and_respond(clean, detected), loop)
+                    # Queue finals instead of firing them concurrently: a single
+                    # consumer preserves the audio ordering (TTS is slow, so
+                    # concurrent coroutines used to answer out of order).
+                    loop.call_soon_threadsafe(finals_q.put_nowait, (clean, detected))
 
         try:
             while not stop_event.is_set():
@@ -247,12 +301,29 @@ async def ws_translate(ws: WebSocket):
                 if new is None:
                     stop_event.wait(0.02)
                     continue
-                _emit(streamer.push(new))
+                with ASR_DECODE_LOCK:
+                    events = streamer.push(new)
+                _emit(events)
             _emit(streamer._finalize())  # close the open utterance on stop
         except Exception as e:
             logger.error(f"ASR thread error: {e}")
 
+    finals_q: asyncio.Queue = asyncio.Queue()
+
+    async def _finals_worker():
+        """Serialize final utterances: translate + synthesize strictly in order."""
+        while True:
+            item = await finals_q.get()
+            if item is None:
+                return
+            text, detected = item
+            try:
+                await _flush_and_respond(text, detected)
+            except Exception as e:
+                logger.error(f"Final response error: {e}")
+
     loop = asyncio.get_running_loop()
+    finals_task = asyncio.create_task(_finals_worker())
     asr_thread = threading.Thread(target=_asr_thread, daemon=True)
     asr_thread.start()
 
@@ -293,14 +364,8 @@ async def ws_translate(ws: WebSocket):
                     arr = np.frombuffer(msg["bytes"], dtype=np.int16).astype(np.float32) / 32767.0
                     src_sr = config.get("sample_rate", 16000)
                     if src_sr and abs(src_sr - SAMPLE_RATE) > 1:
-                        # resample client rate → pipeline rate (16k)
-                        ratio = SAMPLE_RATE / src_sr
-                        new_len = max(1, int(len(arr) * ratio))
-                        arr = np.interp(
-                            np.linspace(0, len(arr) - 1, new_len),
-                            np.arange(len(arr)),
-                            arr,
-                        ).astype(np.float32)
+                        # resample client rate → pipeline rate (16k), anti-aliased
+                        arr = resample_audio(arr, int(round(src_sr)), SAMPLE_RATE)
                     audio_chunks.append(arr)
                 continue
 
@@ -312,40 +377,81 @@ async def ws_translate(ws: WebSocket):
         traceback.print_exc()
     finally:
         stop_event.set()
+        # Let the ASR thread flush its open utterance into finals_q...
+        asr_thread.join(timeout=15)
+        # ...then let the worker send the remaining audio before closing.
+        try:
+            # Schedule the sentinel through the loop too: the ASR thread queues
+            # finals with call_soon_threadsafe, so a direct put_nowait(None)
+            # would overtake (and drop) the last utterance's audio.
+            loop.call_soon_threadsafe(finals_q.put_nowait, None)
+            await asyncio.wait_for(finals_task, timeout=15)
+        except Exception:
+            finals_task.cancel()
 
 
 # ── Startup ────────────────────────────────────────
-@app.on_event("startup")
-async def startup():
+def _load_asr(attempts: int = 6, delay_s: float = 10.0):
+    """Load the ASR model on CUDA, retrying on transient OOM.
+
+    This host shares one GPU with other inference services: a model load can
+    fail with cudaErrorMemoryAllocation while a neighbour is spiking, then
+    succeed a few seconds later. Failing the whole startup on that is wrong.
+    """
+    from nemo.collections.asr.models import EncDecRNNTBPEModel
+
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return EncDecRNNTBPEModel.from_pretrained(
+                model_name=ASR_MODEL_ID,
+                map_location=device,
+            ).eval()
+        except (torch.AcceleratorError, torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            msg = str(e).lower()
+            if "out of memory" not in msg and "memoryallocation" not in msg:
+                raise
+            last_err = e
+            logger.warning(
+                f"ASR load attempt {attempt}/{attempts} hit GPU OOM "
+                f"({torch.cuda.mem_get_info()[0] / 1e9:.1f} GB free); retrying in {delay_s:.0f}s"
+            )
+            torch.cuda.empty_cache()
+            time.sleep(delay_s)
+    raise RuntimeError(f"ASR model could not be loaded after {attempts} attempts: {last_err}")
+
+
+async def _startup():
     global nemo_model
 
     logger.info(f"Loading {ASR_MODEL_ID} on {device}…")
-    from nemo.collections.asr.models import EncDecRNNTBPEModel
-    nemo_model = EncDecRNNTBPEModel.from_pretrained(
-        model_name=ASR_MODEL_ID,
-        map_location=device,
-    )
-    nemo_model.eval()
-    if device == "cuda":
-        nemo_model = nemo_model.to(device)
+    nemo_model = _load_asr()
     logger.info(f"Nemotron ASR loaded ✓ on {device}")
 
     # Prompt-mode fix: fall back to language-agnostic 'auto' prompt when the
     # audio cut carries no language supervision (batch files, mic chunks).
-    import nemo.collections.asr.data.audio_to_text_lhotse_prompt_index as _pidx
-    _orig_get_prompt = _pidx.LhotseSpeechToTextBpeDatasetWithPromptIndex._get_prompt_index_for_cut
-    def _get_prompt_fallback(self, cut):
-        mode = self._get_prompt_mode(cut)
-        lang = getattr(cut.supervisions[0], "language", None)
-        if mode == "langID" and lang:
-            try:
-                return self._get_prompt_index(lang)
-            except ValueError:
-                pass
-        return self.auto_index
-    _pidx.LhotseSpeechToTextBpeDatasetWithPromptIndex._get_prompt_index_for_cut = _get_prompt_fallback
-    logger.info("Nemotron prompt-mode fallback (auto) installed ✓")
+    # This patches a private NeMo hook, so it is best-effort: a NeMo upgrade
+    # must degrade the prompt choice, not prevent the server from starting.
+    try:
+        import nemo.collections.asr.data.audio_to_text_lhotse_prompt_index as _pidx
+
+        _cls = _pidx.LhotseSpeechToTextBpeDatasetWithPromptIndex
+
+        def _get_prompt_fallback(self, cut):
+            mode = self._get_prompt_mode(cut)
+            lang = getattr(cut.supervisions[0], "language", None)
+            if mode == "langID" and lang:
+                try:
+                    return self._get_prompt_index(lang)
+                except ValueError:
+                    pass
+            return self.auto_index
+
+        _cls._get_prompt_index_for_cut = _get_prompt_fallback
+        logger.info("Nemotron prompt-mode fallback (auto) installed ✓")
+    except (ImportError, AttributeError) as e:
+        logger.warning(f"Nemotron prompt-mode fallback skipped ({e})")
 
     init_translation()
-    logger.info(f"TTS backend: {_TTS_BACKEND} (omnivoce)")
+    logger.info(f"TTS backend: {_TTS_BACKEND}")
     await _tts_engine.load_model()

@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
+"""Wrapper that launches the audio-to-audio translator server on port 8741.
+
+The supported entry point is run.sh, which uses the project venv (Python 3.12).
+This file is a convenience fallback for `python server.py`.
 """
-Wrapper that launches the audio-to-audio translator server
-using the Python 3.12 venv (needed for Nemotron ASR / Qwen3-TTS).
-"""
-import sys
 import os
+import sys
 
-# Clean Hermes-injected paths
-sys.path = [p for p in sys.path if not p.startswith("/home/ai-agent/.hermes/installs")]
-
-# Ensure backend module is importable
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import uvicorn
+
 from backend.main import app
 
 if __name__ == "__main__":

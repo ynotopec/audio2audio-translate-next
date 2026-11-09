@@ -1,6 +1,6 @@
 # Audio-to-Audio Translator
 
-Lowest-latency audio-to-audio translation pipeline.
+Low-latency audio-to-audio translation pipeline.
 
 - **Primary**: source-language speech → target-language speech (language1 → language2)
 - **Secondary**: any supported language → primary language (others → primary)
@@ -8,7 +8,7 @@ Lowest-latency audio-to-audio translation pipeline.
 ## Stack
 
 - **ASR**: `nvidia/nemotron-3.5-asr-streaming-0.6b` — multilingual streaming speech recognition (40 languages, cache-aware FastConformer-RNNT, 80ms–1120ms latency)
-- **Translation**: MarianMT (`facebook/marian-mt-*`) — direct language pairs with English intermediary fallback
+- **Translation**: MarianMT (`Helsinki-NLP/opus-mt-*`) — direct language pairs with English intermediary fallback
 - **TTS**: `k2-fsa/OmniVoice` — zero-shot, 600+ languages, 24 kHz output, RTF ~0.05.
   - Language goes in `generate(language=...)` (600+ names/codes), NOT in `instruct`.
   - `instruct` accepts a strict English keyword vocabulary only (accent/age/gender/pitch/whisper — e.g. `"male, moderate pitch"`); anything else raises ValueError. `instruct=None` = auto voice.
@@ -38,7 +38,16 @@ TTS (OmniVoice): 600+ languages, zero-shot; locale ids mapped to language names 
 
 ## Environment
 
-- Single venv: `~/venv/audio2audio-translate-next-py312` (Python 3.12, transformers 5.19.0, torch 2.7.1+cu128).
+- Single venv: `~/venv/audio2audio-translate-next-py312` (Python 3.12, transformers 5.19.0, torch 2.14.1+cu130, nemo-toolkit 3.0.0, omnivoice 0.2.1).
+- Install: torch/torchaudio from the CUDA wheel index **first**, then `pip install -r backend/requirements.txt` (nemo-toolkit must be present or the app cannot import the ASR model).
+- `TTS_BACKEND` must stay unset or `omnivoice`. The `qwen` backend needs transformers==4.57.3 and is incompatible with omnivoice; the app refuses to start if it is requested.
+
+## Runtime model
+
+- Imports are package-relative; the app must be launched as `backend.main` (run.sh / server.py). No `sys.path` manipulation.
+- One `ASR_DECODE_LOCK` serializes `conformer_stream_step` calls, and the TTS engine holds a model lock — concurrent sockets no longer thrash the device.
+- Final utterances go through a per-connection FIFO queue, so translated audio is emitted in the order it was spoken.
+- Uploads are capped (`MAX_UPLOAD_MB`, default 50).
 
 ## Service
 

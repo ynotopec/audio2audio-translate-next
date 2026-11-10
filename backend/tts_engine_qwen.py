@@ -2,7 +2,6 @@
 Qwen3-TTS audio synthesis backend.
 """
 import asyncio
-import queue
 import logging
 from typing import Optional
 
@@ -12,13 +11,11 @@ import torch
 logger = logging.getLogger(__name__)
 
 model = None
-tokenizer = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
 dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
 MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
-# Language mapping: Nemotron locale → Qwen3-TTS language name
 LANG_MAP = {
     "en-US": "English", "en-GB": "English",
     "fr-FR": "French", "fr-CA": "French",
@@ -32,67 +29,43 @@ LANG_MAP = {
     "ru-RU": "Russian",
 }
 
+DEFAULT_SPEAKER = {
+    "Chinese": "vivian",
+    "English": "aiden",
+    "Japanese": "ono_anna",
+    "Korean": "sohee",
+    "German": "dylan",
+    "French": "serena",
+    "Russian": "eric",
+    "Portuguese": "eric",
+    "Spanish": "dylan",
+    "Italian": "sunny",
+}
+
 
 def _tts_lang(locale_id: str) -> str:
-    """Map source locale to Qwen3-TTS language name."""
     return LANG_MAP.get(locale_id, "English")
 
 
-SPEAKERS = {
-    "Vivian": "Bright, slightly edgy young female voice",
-    "Serena": "Warm, gentle young female voice",
-    "Uncle_Fu": "Seasoned male voice with a low, mellow timbre",
-    "Dylan": "Youthful Beijing male voice with a clear, natural timbre",
-    "Eric": "Lively Chengdu male voice with a slightly husky brightness",
-    "Ryan": "Dynamic male voice with strong rhythmic drive",
-    "Aiden": "Sunny American male voice with a clear midrange",
-    "Ono_Anna": "Playful Japanese female voice with a light, nimble timbre",
-    "Sohee": "Warm Korean female voice with rich emotion",
-}
-
-# Default speaker per language
-DEFAULT_SPEAKER = {
-    "Chinese": "Vivian",
-    "English": "Aiden",
-    "Japanese": "Ono_Anna",
-    "Korean": "Sohee",
-    "German": "Ryan",
-    "French": "Serena",
-    "Russian": "Uncle_Fu",
-    "Portuguese": "Ryan",
-    "Spanish": "Ryan",
-    "Italian": "Serena",
-}
-
-
 async def load_model():
-    global model, tokenizer
+    global model
     logger.info(f"Loading {MODEL_ID} on {device}…")
     from qwen_tts import Qwen3TTSModel
-
-    attn_impl = None  # flash-attn not available on this env
-
     model = Qwen3TTSModel.from_pretrained(
         MODEL_ID,
-        device_map="auto" if device == "cuda" else None,
+        device_map="cuda:0" if device == "cuda" else None,
         dtype=dtype,
-        attn_implementation=attn_impl,
     )
-    tokenizer = None  # Qwen3TTSModel handles tokenization internally
     logger.info("Qwen3-TTS model loaded ✓")
 
 
 async def synthesize(text: str, language: str, speaker: Optional[str] = None):
-    """
-    Synthesize speech from text.
-    Returns (samples, sample_rate) tuple.
-    """
     if not text or not text.strip():
         return np.array([], dtype=np.float32), 24000
 
     tts_lang = _tts_lang(language)
     if speaker is None:
-        speaker = DEFAULT_SPEAKER.get(tts_lang, "Serena")
+        speaker = DEFAULT_SPEAKER.get(tts_lang, "aiden")
 
     logger.info(f"TTS: lang={tts_lang}, speaker={speaker}, text_len={len(text)}")
 
@@ -103,9 +76,8 @@ async def synthesize(text: str, language: str, speaker: Optional[str] = None):
             text=text.strip(),
             language=tts_lang,
             speaker=speaker,
-            instruct="",  # No special instruction
+            instruct="",
         )
-        # wavs is list[torch.Tensor] or ndarray
         if isinstance(wavs, list):
             wavs = wavs[0]
         if isinstance(wavs, torch.Tensor):
@@ -117,11 +89,9 @@ async def synthesize(text: str, language: str, speaker: Optional[str] = None):
     return await loop.run_in_executor(None, _run)
 
 
-def get_supported_languages() -> list[str]:
-    """Return list of supported TTS languages."""
-    return list(SPEAKERS.keys())
+def get_supported_languages() -> list:
+    return model.get_supported_languages() if model else []
 
 
-def get_supported_speakers() -> dict[str, str]:
-    """Return {speaker: description}."""
-    return SPEAKERS
+def get_supported_speakers() -> list:
+    return model.get_supported_speakers() if model else []

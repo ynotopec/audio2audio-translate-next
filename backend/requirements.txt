@@ -1,9 +1,33 @@
-fastapi>=0.115.0
-uvicorn>=0.34.0
-torch>=2.5.0
-torchaudio>=2.5.0
-transformers>=4.49.0
-numpy>=2.0.0
-pydantic>=2.0.0
-websockets>=14.0
-qwen-tts>=0.1.0
+# Audio-to-Audio Translator — runtime dependencies
+# Verified working set: Python 3.12, CUDA 13.0 wheels (torch 2.14.1+cu130).
+# Install torch/torchaudio from the CUDA wheel index first, then this file:
+#   pip install torch==2.14.1 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
+#   pip install -r backend/requirements.txt
+
+# ── Web layer ───────────────────────────────────────
+fastapi==0.142.3
+uvicorn==0.54.0
+websockets==17.2
+pydantic==2.13.5
+
+# ── Audio I/O ───────────────────────────────────────
+numpy==2.5.3
+scipy==1.18.1
+soundfile==0.14.0
+
+# ── ASR (Nemotron 3.5 streaming) ────────────────────
+# Imports `nemo.collections.asr` directly; without this the server cannot start.
+nemo-toolkit[asr]==3.0.0
+
+# ── TTS (OmniVoice) ─────────────────────────────────
+# omnivoice 0.2.1 requires transformers>=5.
+omnivoice==0.2.1
+transformers==5.19.0
+
+# ── Torch (pinned pair; CUDA build chosen at install time) ──
+torch>=2.14,<2.15
+torchaudio>=2.11,<2.12
+
+# Legacy TTS backend — DO NOT enable alongside omnivoice.
+# backend/tts_engine_qwen.py needs transformers==4.57.3 (incompatible with >=5).
+# qwen-tts==0.1.1

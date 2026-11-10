@@ -222,18 +222,19 @@ async def translate_file(
         logger.info(f"Translated: {translated}")
 
         # TTS
-        if _tts_engine.model is not None:
-            wavs, tts_sr = await _tts_engine.synthesize(translated, tgt_lang)
-            wav_bytes = audio_to_wav_bytes(trim_silence(np.asarray(wavs, dtype=np.float32), tts_sr), tts_sr)
-        else:
-            wav_bytes = b"Error: TTS model not loaded"
+        if _tts_engine.model is None:
+            raise HTTPException(status_code=503, detail="TTS model not loaded")
+        wavs, tts_sr = await _tts_engine.synthesize(translated, tgt_lang)
+        wav_bytes = audio_to_wav_bytes(trim_silence(np.asarray(wavs, dtype=np.float32), tts_sr), tts_sr)
 
         return Response(content=wav_bytes, media_type="audio/wav")
 
+    except HTTPException:
+        raise
     except Exception as e:
-        import traceback
-        logger.error(f"Batch translate error: {e}\n{traceback.format_exc()}")
-        return Response(content=f"Error: {str(e)}", status_code=500)
+        logger.exception(f"Batch translate error: {e}")
+        return Response(content='{"detail":"internal error"}', status_code=500,
+                        media_type="application/json")
     finally:
         os.unlink(tmp_path)
 
@@ -262,10 +263,13 @@ async def ws_translate(ws: WebSocket):
         translated = translate_text(text, effective_src, config["tgt_lang"])
         await ws.send_json({"type": "transcript", "text": text})
         await ws.send_json({"type": "translated", "text": translated})
-        if _tts_engine.model is not None:
-            wavs, sr = await _tts_engine.synthesize(translated, config["tgt_lang"])
-            wav_bytes = audio_to_wav_bytes(trim_silence(np.asarray(wavs, dtype=np.float32), sr), sr)
-            await ws.send_bytes(wav_bytes)
+        if _tts_engine.model is None:
+            logger.error("TTS model not loaded; audio for this utterance is dropped")
+            await ws.send_json({"type": "error", "detail": "TTS model not loaded"})
+            return
+        wavs, sr = await _tts_engine.synthesize(translated, config["tgt_lang"])
+        wav_bytes = audio_to_wav_bytes(trim_silence(np.asarray(wavs, dtype=np.float32), sr), sr)
+        await ws.send_bytes(wav_bytes)
 
     async def _send_partial(text: str):
         await ws.send_json({"type": "transcript", "text": text})
@@ -308,7 +312,7 @@ async def ws_translate(ws: WebSocket):
         except Exception as e:
             logger.error(f"ASR thread error: {e}")
 
-    finals_q: asyncio.Queue = asyncio.Queue()
+    finals_q = asyncio.Queue()
 
     async def _finals_worker():
         """Serialize final utterances: translate + synthesize strictly in order."""

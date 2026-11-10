@@ -1,9 +1,12 @@
 """
 Translation engine: text→text using MarianMT with English pivot.
 """
+import logging
 import torch
 from transformers import MarianMTModel, MarianTokenizer
 from threading import Lock
+
+logger = logging.getLogger(__name__)
 
 SUPPORTED_LANGS = {
     "en-US": "en", "fr-FR": "fr", "de-DE": "de", "es-ES": "es",
@@ -92,23 +95,31 @@ def _load_translation_pair(src_lang: str, tgt_lang: str):
                     _model_cache[cache_key] = (tok, mdl)
         return _model_cache[cache_key]
 
-    # English pivot fallback
-    if src != PIVOT and src in SUPPORTED_LANGS.values():
-        key1 = f"{src}-{PIVOT}"
-        if key1 not in _model_cache:
-            model_id = _DIRECT_PAIRS.get((src, PIVOT))
-            if model_id:
-                tok = MarianTokenizer.from_pretrained(model_id)
-                mdl = MarianMTModel.from_pretrained(model_id, device_map="auto" if torch.cuda.is_available() else "cpu")
-                _model_cache[key1] = (tok, mdl)
-    if tgt != PIVOT and tgt in SUPPORTED_LANGS.values():
-        key2 = f"{PIVOT}-{tgt}"
-        if key2 not in _model_cache:
-            model_id = _DIRECT_PAIRS.get((PIVOT, tgt))
-            if model_id:
-                tok = MarianTokenizer.from_pretrained(model_id)
-                mdl = MarianMTModel.from_pretrained(model_id, device_map="auto" if torch.cuda.is_available() else "cpu")
-                _model_cache[key2] = (tok, mdl)
+    # English pivot fallback — serialize the load like the direct-pair path so
+    # concurrent requests cannot double-load the same model onto the GPU.
+    with _lock:
+        if src != PIVOT and src in SUPPORTED_LANGS.values():
+            key1 = f"{src}-{PIVOT}"
+            if key1 not in _model_cache:
+                model_id = _DIRECT_PAIRS.get((src, PIVOT))
+                if not model_id:
+                    logger.warning(f"No translation model for pivot pair {src} → {PIVOT}; "
+                                   f"the {src} leg of {src_lang} → {tgt_lang} cannot be translated")
+                else:
+                    tok = MarianTokenizer.from_pretrained(model_id)
+                    mdl = MarianMTModel.from_pretrained(model_id, device_map="auto" if torch.cuda.is_available() else "cpu")
+                    _model_cache[key1] = (tok, mdl)
+        if tgt != PIVOT and tgt in SUPPORTED_LANGS.values():
+            key2 = f"{PIVOT}-{tgt}"
+            if key2 not in _model_cache:
+                model_id = _DIRECT_PAIRS.get((PIVOT, tgt))
+                if not model_id:
+                    logger.warning(f"No translation model for pivot pair {PIVOT} → {tgt}; "
+                                   f"the {tgt} leg of {src_lang} → {tgt_lang} cannot be translated")
+                else:
+                    tok = MarianTokenizer.from_pretrained(model_id)
+                    mdl = MarianMTModel.from_pretrained(model_id, device_map="auto" if torch.cuda.is_available() else "cpu")
+                    _model_cache[key2] = (tok, mdl)
 
     return ("pivot", src, tgt)
 
@@ -151,6 +162,10 @@ def translate_text(text: str, src_lang: str, tgt_lang: str) -> str:
             with torch.no_grad():
                 outputs2 = mdl2.generate(**inputs2)
             return tok2.decode(outputs2[0], skip_special_tokens=True)
+        logger.warning(
+            f"Pivot pair {key1}/{key2} unavailable for {src_lang} → {tgt_lang} — "
+            f"returning source text untranslated"
+        )
 
     return text
 
